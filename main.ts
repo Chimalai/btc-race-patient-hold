@@ -1,54 +1,136 @@
-// Patient-hold cbBTC bot for make.fun's bars-replay/v1.
+// Patient-reversion cbBTC bot for make.fun's bars-replay/v1.
 //
-// Strategy (designed against the kit's published dev window and its
-// baselines): the dev window is a choppy grind where every active baseline
-// that trades often (EMA cross, ADX momentum, RSI/Bollinger) bleeds fees and
-// price impact on each round trip, while simply holding ends positive. So
-// this bot:
+// Designed against the kit's published dev window and its baselines. The
+// window (and BTC generally, at this scale) is range-bound chop around a
+// slow mean: trend-following baselines whipsaw themselves to death on fees
+// and impact (the kit's EMA-cross baseline loses ~10% of the account), and
+// plain buy-and-hold keeps all of the chop's downside. What the data does
+// reward is patience at the band edges:
 //
-//   - enters once, with 97% of its cash, on the first batch it may trade on,
-//   - then holds through ordinary chop, and
-//   - leaves only on a disaster brake: the position worth 4.5% under its
-//     cost (fees included) at a close, after which it stays in cash for the
-//     rest of the window (no re-entry, so a V-shaped dip cannot whipsaw it
-//     twice),
-//   - or on a profit lock: once the position has been worth 3% over its
-//     cost, a fall to 3.5% under that peak value sells it.
+//   - Keep a 240-bar simple moving average of closes (warm-up bars count).
+//   - Flat and the close is at or under 99.6% of that average: buy with 97%
+//     of cash. Dips to a slow mean, in a range, are the cheap seats.
+//   - Holding and the close reaches 100.8% of the average: sell everything.
+//     The round trip banks the spread between the bands (~1.2% gross)
+//     against ~0.35% of fees, slippage and impact, and the bot may re-enter
+//     on the next dip.
+//   - Disaster brake: a position worth 7% under its cost at a close sells
+//     and ends the bot's window (no re-entry), so a dip that turns into a
+//     crash cannot compound.
+//   - Participation fallback: if no trade has happened by bar 600 of the
+//     scored window (a one-way market that never dips), buy 50% of cash
+//     while the close is within 1.5% over the average, so the bot is never
+//     left with zero trades; the same band exit and brake manage it.
 //
-// All decisions are bigint comparisons on the shim's state, so two runs on
-// the same bars produce the same orders byte for byte. The wire protocol is
-// the vendored shim's (vendor/makefun-bars.ts, a copy of the kit's
-// sdk/makefun-bars.ts).
+// All decisions are bigint comparisons on the shim's state and the close
+// history, so two runs on the same bars produce the same orders byte for
+// byte. The wire protocol is the vendored shim's (vendor/makefun-bars.ts,
+// a copy of the kit's sdk/makefun-bars.ts).
 
 import { runBars } from './vendor/makefun-bars.ts';
 
 const SYMBOL = 'CBBTC';
 const MAX_SLIPPAGE_BPS = 100;
-/** Enter with 97% of cash: the remaining 3% covers the buy's fee and impact. */
-const ENTRY_CASH_NUM = 97n;
-const ENTRY_CASH_DEN = 100n;
-/** Disaster brake: value at or under cost * 955/1000 sells everything. */
-const DISASTER_NUM = 955n;
-/** Profit lock arms when the peak value reaches cost * 103/100 ... */
-const ARM_NUM = 103n;
-/** ... and sells when value falls to peak * 965/1000. */
-const TRAIL_NUM = 965n;
-const RATIO_DEN = 1000n;
+/** SMA length in bars. */
+const SMA_N = 240n;
+/** Buy when close * 1000 <= sma * 996 (0.4% under the mean). */
+const BUY_BAND = 996n;
+/** Sell when close * 1000 >= sma * 1008 (0.8% over the mean). */
+const SELL_BAND = 1008n;
+/** Fallback buy allowed while close * 1000 <= sma * 1015. */
+const FALLBACK_BAND = 1015n;
+/** Disaster brake: value * 100 <= cost * 93 sells and ends the window. */
+const BRAKE = 93n;
+/** Scored bar by which the fallback may fire. */
+const FALLBACK_BAR = 600;
+/** Enter with 97% of cash on a band entry. */
+const ENTRY_NUM = 97n;
+/** Enter with 50% of cash on the participation fallback. */
+const FALLBACK_NUM = 50n;
+const CASH_DEN = 100n;
+const BAND_DEN = 1000n;
 
-/** A disaster/profit-lock sell has been sent: never buy again. */
+/** Every CBBTC close seen, in order (bigint raw units). */
+const closes: bigint[] = [];
+/** Running sum of the last SMA_N closes. */
+let windowSum = 0n;
+/** Bars seen while trading was open. */
+let scoredBars = 0;
+/** A position has been held at some point. */
+let hasTraded = false;
+/** The disaster brake has fired: never trade again. */
 let done = false;
-/** Highest position value seen at a close, in quote units. */
-let peakValue = 0n;
+/** A sell has been sent but the position is still there: send it again. */
+let sellSent = false;
 
 await runBars({
   onBatch(state, batch) {
+    for (const bar of batch.bars) {
+      if (bar.symbol !== SYMBOL) continue;
+      const close = BigInt(bar.c);
+      closes.push(close);
+      windowSum += close;
+      if (BigInt(closes.length) > SMA_N) {
+        windowSum -= closes[closes.length - Number(SMA_N) - 1];
+      }
+    }
     if (state.warmingUp) return [];
-    const held = state.positions.get(SYMBOL);
+    scoredBars += 1;
 
-    if (held === undefined) {
-      if (done) return [];
-      const amount = (state.cash * ENTRY_CASH_NUM) / ENTRY_CASH_DEN;
-      if (amount < BigInt(state.hello.fees.min_notional_quote_units)) return [];
+    const held = state.positions.get(SYMBOL);
+    if (held !== undefined) {
+      hasTraded = true;
+      const value = state.value(SYMBOL, held.qty);
+      if (value * 100n <= held.cost * BRAKE) {
+        done = true;
+        sellSent = true;
+        return [
+          {
+            side: 'sell',
+            symbol: SYMBOL,
+            qty: held.qty,
+            max_slippage_bps: MAX_SLIPPAGE_BPS,
+          },
+        ];
+      }
+      if (sellSent) {
+        return [
+          {
+            side: 'sell',
+            symbol: SYMBOL,
+            qty: held.qty,
+            max_slippage_bps: MAX_SLIPPAGE_BPS,
+          },
+        ];
+      }
+      if (BigInt(closes.length) >= SMA_N) {
+        const sma = windowSum / SMA_N;
+        const close = closes[closes.length - 1];
+        if (close * BAND_DEN >= sma * SELL_BAND) {
+          sellSent = true;
+          return [
+            {
+              side: 'sell',
+              symbol: SYMBOL,
+              qty: held.qty,
+              max_slippage_bps: MAX_SLIPPAGE_BPS,
+            },
+          ];
+        }
+      }
+      return [];
+    }
+
+    sellSent = false;
+    if (done) return [];
+    if (BigInt(closes.length) < SMA_N) return [];
+    const sma = windowSum / SMA_N;
+    const close = closes[closes.length - 1];
+    const minNotional = BigInt(state.hello.fees.min_notional_quote_units);
+
+    if (close * BAND_DEN <= sma * BUY_BAND) {
+      const amount = (state.cash * ENTRY_NUM) / CASH_DEN;
+      if (amount < minNotional) return [];
       return [
         {
           side: 'buy',
@@ -58,27 +140,22 @@ await runBars({
         },
       ];
     }
-
-    const value = state.value(SYMBOL, held.qty);
-    if (value > peakValue) peakValue = value;
-
-    let sell = done; // an earlier sell was refused; send it again
-    if (value * RATIO_DEN <= held.cost * DISASTER_NUM) sell = true;
     if (
-      peakValue * 100n >= held.cost * ARM_NUM &&
-      value * RATIO_DEN <= peakValue * TRAIL_NUM
+      !hasTraded &&
+      scoredBars >= FALLBACK_BAR &&
+      close * BAND_DEN <= sma * FALLBACK_BAND
     ) {
-      sell = true;
+      const amount = (state.cash * FALLBACK_NUM) / CASH_DEN;
+      if (amount < minNotional) return [];
+      return [
+        {
+          side: 'buy',
+          symbol: SYMBOL,
+          notional_quote_units: amount,
+          max_slippage_bps: MAX_SLIPPAGE_BPS,
+        },
+      ];
     }
-    if (!sell) return [];
-    done = true;
-    return [
-      {
-        side: 'sell',
-        symbol: SYMBOL,
-        qty: held.qty,
-        max_slippage_bps: MAX_SLIPPAGE_BPS,
-      },
-    ];
+    return [];
   },
 });

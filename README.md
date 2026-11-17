@@ -5,10 +5,11 @@
 [![reward](https://make.fun/badge/btc-race-24h-20261117-0603/Chimalai/btc-race-patient-hold/reward.svg)](https://make.fun/bounty/btc-race-24h-20261117-0603?utm_source=github&utm_medium=readme&utm_campaign=btc-race-24h-20261117-0603)
 
 A long-only cbBTC trading bot for make.fun's "Race a BTC trading bot live
-for 24 hours" bounty (bars-replay/v1). It enters once with 97% of its cash,
-holds through chop, and leaves only on a 4.5% disaster brake or an armed
-3.5% trailing profit lock. See the header comment in `main.ts` for the full
-rationale.
+for 24 hours" bounty (bars-replay/v1). It plays the range around a 240-bar
+moving average: buys dips to 0.4% under the mean with 97% of its cash,
+sells strength at 0.8% over it, re-enters on the next dip, and bails for
+good on a 7% disaster brake. See the header comment in `main.ts` for the
+full rationale.
 
 ## Run it
 
